@@ -1,67 +1,97 @@
 // core/mesh/server.js
 const WebSocket = require("ws");
 
-const wss = new WebSocket.Server({ port: 5000 });
+// --------------------------------------------------
+// ENV CONFIG
+// --------------------------------------------------
+const PORT = process.env.PORT || 5000;
+const REGISTRY_BASE =
+  process.env.REGISTRY_HEARTBEAT_URL || "http://localhost:4000/twin";
+const SERVICE_TOKEN = process.env.REGISTRY_SERVICE_TOKEN || "mesh-secret";
 
-const clients = new Map(); // key: socket, value: { twinId, subscriptions }
+// --------------------------------------------------
+// WebSocket Mesh
+// --------------------------------------------------
+const wss = new WebSocket.Server({ port: PORT });
+const clients = new Map();       // ws → { twinId, subscriptions }
 
-console.log("🌐 Twin Event Mesh running on ws://localhost:5000");
+console.log(`🌐  Twin Event Mesh running on ws://localhost:${PORT}`);
+
+// helper: POST heartbeat
+async function postHeartbeat(twinId) {
+  try {
+    await fetch(`${REGISTRY_BASE}/${twinId}/heartbeat`, {
+      method: "POST",
+      headers: { "x-mesh-token": SERVICE_TOKEN }
+    });
+  } catch (err) {
+    console.error(`⚠️  Heartbeat failed for ${twinId}:`, err.message);
+  }
+}
 
 wss.on("connection", (ws) => {
-  console.log("🔌 Twin connected");
-
-  // Initialize metadata for this client
+  console.log("🔌  Twin connected");
   clients.set(ws, { twinId: null, subscriptions: [] });
 
-  ws.on("message", (msg) => {
+  ws.on("message", async (msg) => {
+    let data;
     try {
-      const data = JSON.parse(msg);
+      data = JSON.parse(msg);
+    } catch (err) {
+      console.error("⚠️  Invalid JSON:", err);
+      return;
+    }
 
-      // Handle registration
-      if (data.type === "register") {
-        const meta = clients.get(ws);
-        meta.twinId = data.twinId;
-        clients.set(ws, meta);
-        console.log(`✅ Registered Twin: ${data.twinId}`);
-        return;
-      }
+    // ── Registration ─────────────────────────────
+    if (data.type === "register") {
+      const meta = clients.get(ws);
+      meta.twinId = data.twinId;
+      clients.set(ws, meta);
+      console.log(`✅  Registered Twin: ${data.twinId}`);
+      return;
+    }
 
-      // Handle topic subscription
-      if (data.type === "subscribe") {
-        const meta = clients.get(ws);
-        meta.subscriptions = data.topics || [];
-        clients.set(ws, meta);
-        console.log(`📡 Twin ${meta.twinId} subscribed to: ${meta.subscriptions.join(", ")}`);
-        return;
-      }
+    // ── Subscriptions ────────────────────────────
+    if (data.type === "subscribe") {
+      const meta = clients.get(ws);
+      meta.subscriptions = data.topics || [];
+      clients.set(ws, meta);
+      console.log(
+        `📡  Twin ${meta.twinId} subscribed to: ${meta.subscriptions.join(", ")}`
+      );
+      return;
+    }
 
-      // Handle event publishing
-      if (data.type === "event") {
-        const { topic, payload } = data;
-        const sender = clients.get(ws);
+    // ── Publish Event  (includes heartbeat) ──────
+    if (data.type === "event") {
+      const { topic, payload } = data;
+      const sender = clients.get(ws);
 
-        // Broadcast to all subscribers of the topic
-        for (const [client, meta] of clients.entries()) {
-          if (client !== ws && meta.subscriptions.includes(topic)) {
-            client.send(JSON.stringify({
+      // 1. broadcast to subscribers
+      for (const [client, meta] of clients.entries()) {
+        if (client !== ws && meta.subscriptions.includes(topic)) {
+          client.send(
+            JSON.stringify({
               type: "event",
               topic,
               payload,
               from: sender?.twinId || "unknown"
-            }));
-          }
+            })
+          );
         }
-        console.log(`📤 Event on topic '${topic}' sent from ${sender?.twinId}`);
-        return;
       }
+      console.log(`📤  Event '${topic}' sent from ${sender?.twinId}`);
 
-    } catch (err) {
-      console.error("⚠️ Error processing message:", err);
+      // 2. heartbeat ping
+      if (sender?.twinId) {
+        postHeartbeat(sender.twinId);      // ← NEW
+      }
+      return;
     }
   });
 
   ws.on("close", () => {
-    console.log("❌ Twin disconnected");
+    console.log("❌  Twin disconnected");
     clients.delete(ws);
   });
 });
